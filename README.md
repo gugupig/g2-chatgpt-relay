@@ -157,3 +157,7 @@ adb forward tcp:8787 tcp:8777
 python3 -I tools/fake_glasses.py --broker 127.0.0.1:8787 --cmd inspect
 scripts/android.sh logs          # App 和页面的日志
 ```
+
+## 许可
+
+[MIT](LICENSE)。使用本项目操作 ChatGPT 账号的风险由使用者自己承担，见开头的风险提示。

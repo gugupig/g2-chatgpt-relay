@@ -1,0 +1,23 @@
+{
+  "name": "g2-chatgpt-relay-plugin",
+  "private": true,
+  "version": "0.4.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "pack": "npm run build && evenhub pack app.json dist -o chatrelay.ehpk",
+    "simulate": "node node_modules/@evenrealities/evenhub-simulator/bin/index.js http://localhost:5173",
+    "qr": "evenhub qr --port 5173"
+  },
+  "dependencies": {
+    "@evenrealities/even_hub_sdk": "^0.0.16"
+  },
+  "devDependencies": {
+    "@evenrealities/evenhub-cli": "^0.2.0",
+    "@evenrealities/evenhub-simulator": "^0.9.5",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.6"
+  }
+}

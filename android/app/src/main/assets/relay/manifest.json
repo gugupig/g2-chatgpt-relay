@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "G2 chatgpt.com relay",
+  "version": "0.8.0",
+  "description": "Built into the G2 Relay app: glasses audio into chatgpt.com dictation, reply text back to the glasses.",
+  "browser_specific_settings": {
+    "gecko": { "id": "g2-chatgpt-relay@local" }
+  },
+  "background": { "scripts": ["relay-bg.js"] },
+  "content_security_policy": { "extension_pages": "script-src 'self'" },
+  "host_permissions": ["https://chatgpt.com/*", "ws://127.0.0.1/*"],
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["synth-mic.js", "reply-watch.js", "glasses-text.js", "relay-main.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["relay-bridge.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

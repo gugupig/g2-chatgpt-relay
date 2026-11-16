@@ -4,6 +4,12 @@
 //   hold          push to talk: talking while the press lasts
 //   swipe up/down scroll the conversation by a screen
 //   double tap    menu (while talking: cancel)
+// Talking waits until the reply has finished: a turn started over a streaming
+// reply took that reply for its own. Every start carries the conversation the
+// glasses show, and the page refuses it if another one is open (then sends
+// its own), so a turn never lands in a conversation the glasses don't show.
+// 刷新 in the menu asks the page to drop a stuck turn and resend the
+// conversation; if it doesn't answer, the app reloads chatgpt.com.
 // A tap does nothing (it started a talk too easily), except end a talk whose
 // release got lost.
 //
@@ -106,6 +112,8 @@ const st = {
   turns: [] as Turn[], // finished turns of the open conversation
   live: null as Turn | null, // the turn being talked or answered
   title: '',
+  // The conversation shown: its id, null for a new one, undefined if unknown.
+  chat: undefined as string | null | undefined,
   cached: false, // turns came from local storage, not yet from the page
   top: 0, // first visible line of the conversation
   pinned: false, // the last turn may scroll to the top of the screen
@@ -309,6 +317,7 @@ const MENU: ListPage = {
     { name: '新对话', run: () => newChat() },
     { name: '历史对话', run: () => listChats() },
     { name: '退出', run: () => void bridge.shutDownPageContainer(1) },
+    { name: '刷新', run: () => refresh() },
     { name: '跳到最新一轮', run: () => showLatestTurn() },
     { name: '回到开头', run: () => void ((st.top = 0), (st.pinned = false)) },
     { name: '返回', run: () => {} },
@@ -380,15 +389,44 @@ function chatsPage(n: number): ListPage {
 function openChat(c: Chat) {
   if (c.current) return showLatestTurn()
   if (busy()) return flash('说完或等回复结束后再切换')
+  // Show nothing of the old conversation meanwhile; its history follows.
+  st.turns = []
+  st.live = null
+  st.title = c.title
+  st.chat = c.id
+  st.cached = false
+  st.top = 0
   send({ t: 'open-chat', id: c.id })
   flash(`正在打开：${clip(c.title, 30)}`, 8000)
+}
+
+// Asks the page to drop whatever turn is stuck and resend the conversation;
+// a page that doesn't answer in time gets reloaded by the app.
+const REFRESH_MS = 10_000
+let refreshTimer: ReturnType<typeof setTimeout> | null = null
+function refresh() {
+  if (st.ws !== 'open') return flash('手机上的 G2 Relay 没连上')
+  if (st.phase === 'listening' || st.phase === 'starting') void stopTalk(false)
+  st.live = null
+  st.phase = 'idle'
+  st.detail = ''
+  if (refreshTimer) clearTimeout(refreshTimer)
+  if (!st.page) return reloadPage()
+  send({ t: 'refresh' })
+  flash('正在刷新…', REFRESH_MS)
+  refreshTimer = setTimeout(reloadPage, REFRESH_MS)
+}
+function reloadPage() {
+  refreshTimer = null
+  send({ t: 'reload' })
+  flash('页面没响应，正在重新加载网页…', 20_000)
 }
 
 // --- local cache -------------------------------------------------------------
 // The last turns, so reopening the plugin shows the conversation at once.
 async function saveCache() {
   const turns = st.turns.slice(-CACHE_TURNS).map(t => ({ ...t, reply: t.reply.slice(0, 4000) }))
-  await bridge.setLocalStorage(CACHE_KEY, JSON.stringify({ title: st.title, turns }))
+  await bridge.setLocalStorage(CACHE_KEY, JSON.stringify({ title: st.title, chat: st.chat, turns }))
 }
 
 async function loadCache() {
@@ -399,6 +437,7 @@ async function loadCache() {
     if (!Array.isArray(c.turns)) return
     st.turns = c.turns
     st.title = c.title ?? ''
+    st.chat = c.chat
     st.cached = true
     showLatestTurn()
     render()
@@ -448,6 +487,11 @@ const ERRORS: [RegExp, string][] = [
   [/^new chat did not open/, '新对话没有打开'],
   [/^chat not found in the sidebar/, '侧边栏里找不到这个对话'],
   [/^chat did not open/, '对话没有打开'],
+  [/^page shows another chat/, '手机上打开的是另一个对话，已同步过来，请再说一次'],
+  [/^reply still in progress/, 'ChatGPT 还在回复，等它说完再说话'],
+  [/^no reply started/, 'ChatGPT 一分钟没有回复；可以双击菜单 → 刷新'],
+  [/^reply timed out/, '回复超时；可以双击菜单 → 刷新'],
+  [/^composer not empty/, '输入框里的旧文字删不掉，这一轮没有发出；请在手机上手动清空'],
 ]
 const errorText = (e: string) => ERRORS.find(([re]) => re.test(e))?.[1] ?? e
 
@@ -457,19 +501,26 @@ function onMessage(msg: any) {
   switch (msg.t) {
     case 'peer':
       if (msg.page && !st.page) send({ t: 'get-history' })
+      // A reload or crash mid-turn: no reply is coming.
+      if (!msg.page && st.page && busy()) pageLost()
       st.page = !!msg.page
       break
     case 'history':
       // Mid-turn the live turn is newer than the page's DOM; it arrives again later.
       if (busy()) break
+      if (refreshTimer) clearTimeout(refreshTimer)
+      refreshTimer = null
       st.notice = ''
       st.turns = (msg.turns as Turn[]).map(t => ({ user: t.user ?? '', reply: t.reply ?? '', done: true }))
       st.live = null
       st.title = msg.title ?? ''
+      st.chat = msg.chat ?? null
       st.cached = false
       if (st.phase === 'error') st.phase = 'idle'
       showLatestTurn()
       void saveCache()
+      if (msg.why === 'resync') flash('已同步到手机上打开的对话，请再说一次', 5000)
+      else if (msg.why === 'refresh') flash('已刷新', 2000)
       break
     case 'chats':
       st.chats = msg.chats as Chat[]
@@ -504,6 +555,7 @@ function onMessage(msg: any) {
       st.live.reply = msg.text
       st.phase = msg.done ? 'done' : 'replying'
       if (msg.done) {
+        if ('chat' in msg) st.chat = msg.chat
         send({ t: 'metric', doneAfterStopMs: Math.round(performance.now() - st.stoppedAt), replyChars: msg.text.length, lines: wrap(msg.text).length })
         st.live.done = true
         st.doneAt = performance.now()
@@ -516,11 +568,21 @@ function onMessage(msg: any) {
   render()
 }
 
+function pageLost() {
+  if (talkTimer) clearInterval(talkTimer)
+  talkTimer = null
+  void bridge.audioControl(false)
+  st.live = null
+  st.phase = 'error'
+  st.detail = '手机上的 chatgpt.com 页面断开了，这一轮没有发出或没收到回复'
+}
+
 function newChat() {
   st.turns = []
   st.live = null
   st.top = 0
   st.title = ''
+  st.chat = null
   st.cached = false
   st.firstReplyAt = 0
   st.phase = 'idle'
@@ -542,10 +604,12 @@ async function startTalk() {
   st.talkStartedAt = performance.now()
   showLatestTurn()
   render()
-  send({ t: 'start' })
+  send(st.chat === undefined ? { t: 'start' } : { t: 'start', chat: st.chat })
   // Never leave a second timer running (a leaked one kept sending "stop" every 500 ms).
   if (talkTimer) clearInterval(talkTimer)
   const ok = await bridge.audioControl(true, AudioInputSource.Glasses)
+  // The page may already have refused the turn (another chat, a reply still going).
+  if (st.phase !== 'starting' && st.phase !== 'listening') return void bridge.audioControl(false)
   if (!ok) {
     st.phase = 'error'
     st.detail = '眼镜麦克风没有启动'
@@ -624,7 +688,8 @@ bridge.onEvenHubEvent(event => {
       if (st.phase === 'listening') void stopTalk(true)
       return
     case OsEventTypeList.LONG_PRESS_EVENT:
-      if (!talking) void startTalk()
+      if (st.phase === 'waiting' || st.phase === 'replying') flash('等回复结束再说话 · 卡住了就双击菜单 → 刷新', 4000)
+      else if (!talking) void startTalk()
       return
     case OsEventTypeList.LONG_PRESS_RELEASE_EVENT:
       if (talking) void stopTalk(true)

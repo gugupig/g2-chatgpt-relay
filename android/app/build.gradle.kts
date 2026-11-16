@@ -13,8 +13,8 @@ android {
         applicationId = "com.g2codeterminal.relay"
         minSdk = 26
         targetSdk = 36
-        versionCode = 16
-        versionName = "0.4.0"
+        versionCode = 17
+        versionName = "0.5.0"
         // The test phone (Galaxy Z Fold5) is arm64; GeckoView ships every ABI.
         ndk { abiFilters += "arm64-v8a" }
     }

@@ -104,6 +104,9 @@
       if (now() - turn.lastChangeAt >= COMPLETE_GRACE_MS) finishTurn('complete')
       return
     }
+    // The stop button went away and no text ever came (an error, or a reply
+    // the selectors can't read): end the turn rather than wait forever.
+    if (s.stop != null && !turn.text && now() - turn.t0 - s.stop > 15000) return finishTurn('stopped without text')
     if (s.stable == null) return
     const sinceStable = now() - turn.t0 - s.stable
     if (turn.state == null && s.stop != null && s.actions != null && (s.sse != null || sinceStable > 3000)) finishTurn('stop+actions')
@@ -144,7 +147,8 @@
   function poll() {
     // Turns open on the stop button or the conversation request, not on new
     // user bubbles: an existing chat renders its old bubbles after page load.
-    const stopVisible = !!document.querySelector(SEL.stop)
+    // Not dictation's "Stop dictation", which the English stop selector also matches.
+    const stopVisible = [...document.querySelectorAll(SEL.stop)].some(b => !/dictation|听写/i.test(b.getAttribute('aria-label') ?? ''))
     if (stopVisible && (!turn || turn.done)) startTurn('stop button appeared')
     if (!turn || turn.done) return
 

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "G2 chatgpt.com relay",
-  "version": "0.8.0",
+  "version": "0.9.2",
   "description": "Built into the G2 Relay app: glasses audio into chatgpt.com dictation, reply text back to the glasses.",
   "browser_specific_settings": {
     "gecko": { "id": "g2-chatgpt-relay@local" }

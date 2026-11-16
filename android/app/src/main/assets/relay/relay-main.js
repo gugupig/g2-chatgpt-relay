@@ -1,6 +1,8 @@
 // End-to-end prototype, page side: drives chatgpt.com from glasses commands.
 //
-//   start  → open a live synthetic-mic turn, click the dictation button
+//   start  → {chat}: open a live synthetic-mic turn, click the dictation
+//            button; refused when the page shows another conversation than
+//            the glasses (chat: the id they show, null for a new chat)
 //   PCM    → push into the live stream
 //   stop   → let the audio play out, click the dictation "done" button, wait
 //            for the transcript to land in the composer, click send
@@ -9,6 +11,7 @@
 //   new-chat    → open a new conversation, then send its (empty) history
 //   list-chats  → {t: "chats", chats: [{id, title, current}]} from the sidebar
 //   open-chat   → {id}: open that conversation, then send its history
+//   refresh     → drop a stuck turn, close the sidebar, send the history now
 // The reply is read by reply-watch.js and forwarded as {t: "reply"} updates.
 //
 // Runs in the page's MAIN world after synth-mic.js and reply-watch.js. The
@@ -36,6 +39,8 @@
     composer: '#prompt-textarea, textarea[name="prompt-textarea"], [contenteditable="true"][id*="prompt"], form [contenteditable="true"], form textarea',
     autoSend: true,
     transcriptTimeoutMs: 20000,
+    replyStartTimeoutMs: 60000, // sent, but no reply appeared
+    replyTimeoutMs: 600000, // a reply that never finishes
     replyThrottleMs: 250,
   }
 
@@ -96,14 +101,37 @@
     const c = composer()
     return c ? (c.value ?? c.innerText ?? '').trim() : ''
   }
+  // Selects the composer's own contents rather than selectAll, which picks
+  // the whole page when the focus didn't land in the composer.
   function clearComposer() {
     const c = composer()
     if (!c) return
     c.focus()
-    document.execCommand('selectAll')
+    if (c.tagName === 'TEXTAREA') {
+      c.select()
+    } else {
+      const range = document.createRange()
+      range.selectNodeContents(c)
+      const sel = getSelection()
+      sel.removeAllRanges()
+      sel.addRange(range)
+    }
     document.execCommand('delete')
   }
+  // Leftover text would ride along with the next transcript (a failed or
+  // interrupted turn leaves its transcript there): empty it and check.
+  async function emptyComposer(why) {
+    const had = composerText().length
+    for (let i = 0; i < 3 && composerText(); i++) {
+      clearComposer()
+      await sleep(150)
+    }
+    if (had) log(`cleared ${had} characters from the composer (${why}), ${composerText().length} left`)
+    return !composerText()
+  }
   const labelSet = () => new Set(buttons().map(labelOf).filter(Boolean))
+  // ChatGPT is writing a reply: its stop button is up (not dictation's "Stop dictation").
+  const streaming = () => [...document.querySelectorAll(watch.SEL.stop)].some(b => !/dictation|听写/i.test(labelOf(b)))
 
   // --- turn state machine --------------------------------------------------
   let phase = 'idle'
@@ -122,9 +150,21 @@
   // page when that happens drops out quietly: a double tap reaches us as a
   // start followed half a second later by a cancel, while the start waits.
   let turnId = 0
-  async function start() {
-    await pendingNewChat
+  async function start(msg = {}) {
+    await pendingNav
+    // A new turn while a reply streams would take that reply for its own.
+    if (phase === 'sending' || phase === 'replying' || streaming()) {
+      log('start refused: a reply is still streaming')
+      return toBridge({ t: 'status', s: 'error', error: 'reply still in progress', at: at() })
+    }
     if (phase !== 'idle' && phase !== 'error') await cancel('new start')
+    // The glasses would show this turn under one conversation while it lands
+    // in another: send them the page's instead.
+    if ('chat' in msg && !sameChat(msg.chat)) {
+      log(`start refused: glasses show ${msg.chat ? 'another chat' : 'a new chat'}, page ${chatId() ? 'a chat' : 'a new chat'}`)
+      fail('page shows another chat')
+      return sendHistory('resync')
+    }
     const id = ++turnId
     const stale = () => id !== turnId
     t0 = performance.now()
@@ -133,7 +173,8 @@
     mic.live.begin() // queue frames from the first one, even before the page opens the mic
     const ctx = mic.audioContext()
     if (ctx.state !== 'running') {
-      await Promise.race([ctx.resume(), sleep(300)])
+      // The first resume after the app starts can take most of a second.
+      await Promise.race([ctx.resume(), sleep(1500)])
       if (stale()) return
       if (ctx.state !== 'running') return fail('audio not armed: tap the chatgpt.com page once', { ctx: ctx.state })
     }
@@ -152,11 +193,8 @@
     if (!btn) return fail('dictation button not found', { buttons: [...labelSet()].slice(0, 40) })
     // chatgpt.com keeps unsent drafts, e.g. a transcript from a failed turn;
     // the glasses cannot see it, so it must not ride along with this one.
-    const draft = composerText().length
-    if (draft) {
-      clearComposer()
-      log(`cleared a ${draft}-character draft, ${composerText().length} left`)
-    }
+    if (!(await emptyComposer('before dictation'))) return fail('composer not empty')
+    if (stale()) return
     before = { text: composerText(), labels: labelSet() }
     press(btn)
     log(`clicked "${labelOf(btn)}"`)
@@ -210,11 +248,25 @@
     }, 3000)
     if (!send) return fail('send button not found or disabled', { added: [...labelSet()].filter(l => !before.labels.has(l)) })
     phase = 'sending'
+    const sentAt = performance.now()
     watch.arm()
     press(send)
     log(`clicked "${labelOf(send)}"`)
     status('sent')
     phase = 'replying'
+    replyTimer(id, sentAt)
+  }
+
+  // A send that never gets a reply (or one that never ends) would leave the
+  // page busy, deferring history and refusing turns, until the next refresh.
+  function replyTimer(id, sentAt) {
+    const tick = setInterval(() => {
+      if (id !== turnId || phase !== 'replying') return clearInterval(tick)
+      const waited = performance.now() - sentAt
+      const started = watch.turns.at(-1)?.t0 > sentAt
+      if (!started && waited > CFG.replyStartTimeoutMs) clearInterval(tick), fail('no reply started')
+      else if (waited > CFG.replyTimeoutMs) clearInterval(tick), fail('reply timed out')
+    }, 1000)
   }
 
   async function cancel(why = 'cancel') {
@@ -229,6 +281,8 @@
   }
 
   function fail(error, extra = {}) {
+    // A transcript that never went out stays in the composer otherwise.
+    if (phase === 'transcribing' || phase === 'sending') void emptyComposer('failed turn')
     phase = 'error'
     mic.live.close()
     log(`ERROR ${error}`, extra)
@@ -263,7 +317,7 @@
   }
   watch.hooks.onDone = (turn, reason) => {
     clearTimeout(pendingTimer)
-    toBridge({ t: 'reply', n: turn.n, text: replyText(turn), done: true, reason, at: at() })
+    toBridge({ t: 'reply', n: turn.n, text: replyText(turn), done: true, reason, chat: chatId(), at: at() })
     if (phase === 'replying' || phase === 'sending') phase = 'idle'
     payHistory()
   }
@@ -313,6 +367,10 @@
     return turns.slice(-HISTORY_TURNS)
   }
   const chatId = () => location.pathname.match(/\/c\/([\w-]+)/)?.[1] ?? null
+  // The first message of a new chat gives it an id; the glasses may still
+  // call it new (null) until the history with that id reaches them.
+  let createdChat = null
+  const sameChat = want => chatId() === want || (want === null && chatId() === createdChat)
   let owedHistory = null
   function payHistory() {
     if (owedHistory) void settledHistory(owedHistory)
@@ -351,6 +409,7 @@
   let navigating = false
   setInterval(() => {
     if (navigating || location.pathname === lastPath) return
+    if (!/\/c\//.test(lastPath) && phase !== 'idle') createdChat = chatId()
     lastPath = location.pathname
     void settledHistory('navigated')
   }, 1000)
@@ -396,14 +455,18 @@
     }
   }
 
-  let pendingNewChat = null
+  let pendingNav = null
   async function newChat() {
     if (phase !== 'idle' && phase !== 'error') await cancel('new chat')
     const { el } = await inSidebar(newChatButton)
     if (!el) return fail('new chat button not found')
     press(el)
     log(`new chat: clicked "${labelOf(el)}"`)
-    if (!(await waitFor(() => chatId() === null && readHistory().length === 0, 4000))) return fail('new chat did not open')
+    if (!(await waitFor(() => chatId() === null && readHistory().length === 0, 4000))) {
+      fail('new chat did not open')
+      return sendHistory('resync') // the glasses cleared their view; show what is really open
+    }
+    createdChat = null
     lastPath = location.pathname
     await settledHistory('new-chat')
   }
@@ -435,16 +498,44 @@
     if (phase !== 'idle' && phase !== 'error') await cancel('open chat')
     if (chatId() !== id) {
       const { el } = await inSidebar(() => chatLinks().find(c => c.id === id && visible(c.a))?.a ?? null)
-      if (!el) return fail('chat not found in the sidebar')
+      if (!el) {
+        fail('chat not found in the sidebar')
+        return sendHistory('resync')
+      }
       press(el)
       log('open chat: clicked')
-      if (!(await waitFor(() => chatId() === id, 4000))) return fail('chat did not open')
+      if (!(await waitFor(() => chatId() === id, 4000))) {
+        fail('chat did not open')
+        return sendHistory('resync')
+      }
       // A phone-width sidebar may stay open over the conversation.
       if (sidebarButton('close-sidebar-button', CLOSE_SIDEBAR)) closeSidebar()
     }
     lastPath = location.pathname
     await waitFor(() => readHistory().length > 0, 4000)
     await settledHistory('open-chat')
+  }
+
+  // Gets the page unstuck without reloading it (a reload drops the armed
+  // audio): ends whatever turn is open, then sends the conversation as it is
+  // now. A reply still streaming keeps going (start refuses until it ends);
+  // the history follows again when it is done.
+  async function refresh() {
+    turnId++
+    const c = findButton(CFG.dictateCancel)
+    if (c) press(c)
+    mic.live.close()
+    if (sidebarButton('close-sidebar-button', CLOSE_SIDEBAR)) closeSidebar()
+    const writing = streaming()
+    log(`refresh in phase ${phase}${c ? ', cancelled dictation' : ''}${writing ? ', reply still streaming' : ''}`)
+    if (!writing) {
+      watch.finishTurn('refresh')
+      await emptyComposer('refresh')
+    }
+    phase = 'idle'
+    lastPath = location.pathname
+    await settledHistory('refresh')
+    if (writing) owedHistory = 'refresh'
   }
 
   // --- debugging -----------------------------------------------------------
@@ -476,15 +567,19 @@
     const msg = JSON.parse(d.slice(8))
     switch (msg.t) {
       case 'start':
-        return start().catch(err => fail(String(err)))
+        return start(msg).catch(err => fail(String(err)))
       case 'stop':
         return stop().catch(err => fail(String(err)))
       case 'cancel':
         return cancel()
       case 'clear':
         // Empties the composer (after a dry run with autoSend off).
-        clearComposer()
-        return toBridge({ t: 'cleared', left: composerText() })
+        return void emptyComposer('asked').then(() => toBridge({ t: 'cleared', left: composerText().length }))
+      case 'type':
+        // Debugging: leaves a draft in the composer, as a failed turn would.
+        composer()?.focus()
+        document.execCommand('insertText', false, String(msg.text ?? ''))
+        return toBridge({ t: 'typed', len: composerText().length })
       case 'inspect':
         return toBridge(inspect())
       case 'config':
@@ -496,9 +591,11 @@
       case 'list-chats':
         return listChats().catch(err => fail(String(err)))
       case 'open-chat':
-        return navigation(() => openChat(String(msg.id))).catch(err => fail(String(err)))
+        return (pendingNav = navigation(() => openChat(String(msg.id))).catch(err => fail(String(err))))
       case 'new-chat':
-        return (pendingNewChat = navigation(newChat).catch(err => fail(String(err))))
+        return (pendingNav = navigation(newChat).catch(err => fail(String(err))))
+      case 'refresh':
+        return void navigation(refresh).catch(err => fail(String(err)))
       case 'peer':
         log(`peers: glasses ${msg.glasses ? 'on' : 'off'}`)
         if (msg.glasses && !glassesOn) void settledHistory('glasses connected')

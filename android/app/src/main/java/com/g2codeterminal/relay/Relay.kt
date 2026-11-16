@@ -70,6 +70,12 @@ object Relay {
 
     fun session(ctx: Context): GeckoSession = session ?: open(ctx)
 
+    /** Reloads chatgpt.com, e.g. when the glasses find the page script unresponsive. */
+    fun reloadPage() = main.post {
+        Log.i(TAG, "reloading the page")
+        session?.reload()
+    }
+
     /** Undoes whatever GeckoView does when its window goes away. */
     fun keepActive() {
         session?.apply {

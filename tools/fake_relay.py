@@ -8,7 +8,12 @@ On connect it reports the page as present. {t: "get-history"} gets --turns
 canned turns; start/stop play a dictation, a transcript and a streamed reply;
 new-chat answers with an empty history; list-chats gets --chats fake chats
 (a scheduled-task one, one with an image reply, long titles) and open-chat
-switches to one. --fail makes every stop end in an error instead. Audio frames are counted and dropped. Standard library only.
+switches to one. start with another {chat} than the open one is refused
+with a resync, like the page does; refresh resends the history (--stuck:
+never, so the plugin falls back to {t: "reload"}). --drift switches chats
+behind the glasses' back after each reply, to try the refusal. --fail makes every stop
+end in an error instead. Audio frames are counted and dropped. Standard
+library only.
 """
 import argparse
 import asyncio
@@ -105,8 +110,11 @@ class Page:
     async def send(self, **msg):
         await ws_send(self.w, 0x1, json.dumps(msg, ensure_ascii=False).encode())
 
+    def chat_id(self):
+        return f"fake-{self.chat}" if self.turns else None
+
     async def history(self, why):
-        chat = f"fake-{self.chat}" if self.turns else None
+        chat = self.chat_id()
         title = TITLES[self.chat % len(TITLES)] if self.turns else "ChatGPT"
         await self.send(t="history", why=why, chat=chat, title=title, turns=self.turns)
 
@@ -124,8 +132,12 @@ class Page:
         for i in range(0, len(REPLY), 12):
             await self.send(t="reply", n=len(self.turns) + 1, text=REPLY[: i + 12], done=False)
             await asyncio.sleep(0.25)
-        await self.send(t="reply", n=len(self.turns) + 1, text=REPLY, done=True, reason="complete")
         self.turns.append({"user": question, "reply": REPLY, "done": True})
+        await self.send(t="reply", n=len(self.turns), text=REPLY, done=True, reason="complete", chat=self.chat_id())
+        if self.args.drift:
+            self.chat = (self.chat + 1) % self.args.chats
+            self.turns = chat(self.chat)
+            log(f"drifted to fake-{self.chat} without telling the glasses")
 
     async def on(self, msg):
         t = msg.get("t")
@@ -148,12 +160,22 @@ class Page:
             await asyncio.sleep(0.5)
             await self.history("new-chat")
         elif t == "start":
+            if "chat" in msg and msg["chat"] != self.chat_id():
+                await self.send(t="status", s="error", error="page shows another chat")
+                return await self.history("resync")
             self.frames = 0
             await asyncio.sleep(0.3)
             await self.send(t="status", s="listening")
         elif t == "stop":
             log(f"{self.frames} audio frames")
             self.task = asyncio.create_task(self.answer())
+        elif t == "refresh":
+            if not self.args.stuck:
+                await asyncio.sleep(0.5)
+                await self.history("refresh")
+        elif t == "reload":
+            log("reload asked: the app would reload chatgpt.com")
+            await self.history("asked")
         elif t == "cancel":
             await self.send(t="status", s="idle", why="cancel")
 
@@ -186,6 +208,8 @@ async def main():
     ap.add_argument("--turns", type=int, default=3)
     ap.add_argument("--chats", type=int, default=13)
     ap.add_argument("--fail", action="store_true")
+    ap.add_argument("--stuck", action="store_true")
+    ap.add_argument("--drift", action="store_true")
     args = ap.parse_args()
     server = await asyncio.start_server(lambda r, w: handle(r, w, args), "127.0.0.1", args.port)
     log(f"fake relay on 127.0.0.1:{args.port}")

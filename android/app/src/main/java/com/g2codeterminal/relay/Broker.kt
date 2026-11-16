@@ -22,6 +22,9 @@ import org.json.JSONObject
  *   /?role=ctl      debugging from the Mac through `adb forward tcp:8777
  *                   tcp:8777`: sends commands to the page, sees every message
  *
+ * {"t": "reload"} from the glasses or ctl is handled here, not by the page:
+ * it reloads chatgpt.com, so it works when the page script itself is stuck.
+ *
  * Glasses messages go to the page and page messages to the glasses (and ctl);
  * the broker adds {"t": "peer"} notices when a side connects or leaves.
  */
@@ -94,6 +97,11 @@ class Broker(port: Int) : WebSocketServer(InetSocketAddress(LOOPBACK, port)) {
         val t = obj.optString("t")
         if (t == "ping") {
             conn.send(JSONObject().put("t", "pong").put("ts", obj.opt("ts")).toString())
+            return
+        }
+        if (t == "reload" && role != "page") {
+            Log.i(TAG, "$role asked for a page reload")
+            Relay.reloadPage()
             return
         }
         if (role == "glasses" && t == "start") {
